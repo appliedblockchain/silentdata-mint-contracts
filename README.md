@@ -1,6 +1,22 @@
-# silentdata-mint/contracts: Algorand smart contracts and supporting components
+# Silent Data Mint Smart Contracts
 
-This code has not been security audited and should only be used as an example.
+**Note:** This code has not been security audited and should only be used as an example.
+
+[Silent Data](https://silentdata.com) is a platform for proving properties of private web2 data in the form of signed proof certificates that can be consumed by smart contracts. Silent Data leverages Intel SGX enclaves in order to enable privacy-preserving retrieval and processing of off-chain data, and generation of cryptographic proofs that are verifiable in blockchain smart contracts. This ensures that sensitive information is never revealed, not even to those hosting the platform, and that the code used to retrieve the data and generate the proofs cannot be modified or interfered with by the operator.
+
+Silent Data Mint is a decentralised application for tokenising off-chain assets on the Algorand blockchain. Silent Data Mint is composed of a stateful smart contract, the minting contract, deployed on the Algorand blockchain and a templated smart signature designed to hold the verified asset properties. The accepted enclave signing public key and proof type are stored in the global storage of the contract when it is created. Any user is able to read the public key and verify that it comes from a legitimate enclave.
+
+After successfully completing the proof process relevant for the chosen asset type on Silent Data, the owner of the asset will have access to the signed proof certificate. This proof certificate contains a unique asset ID and the expected address of the asset smart signature. The asset owner can recreate the smart signature address by replacing the asset ID in the smart signature template, they can then use this smart signature to interact with the minting contract. In order for the asset to be minted, the smart signature must be funded with the minimum balance required to opt in to a stateful contract and one asset.
+
+The asset owner must initially transfer the minimum balance to the asset address and use the asset smart signature to opt in to the minting contract. The asset owner then uploads the proof data and signature from the Silent Data certificate to the minting contract in a transaction signed by their wallet private key along with the address of the asset smart signature. As the smart signature address is unique to the asset, the minting contract can check if the asset has already been minted by querying the local storage of the address. When an asset is minted successfully the minting contract will write to the local storage, so if data has already been written then the contract knows that the asset has already been minted.
+
+The minting contract will verify the signature using the global public key and then parse the CBOR encoded data to extract the wallet address of the owner, the asset address, the proof type and the verified properties of the asset. The wallet address is compared with the sender of the transaction and the asset address is compared with the smart signature address passed to the transaction. The proof type is also compared with the allowed value for this minting contract. If all of the verifications are successful the minting contract will write the verified asset properties into the local storage of the asset smart signature.
+
+The minting contract will then generate a pair of ownership tokens and write the asset ID of the ownership token and the asset address to the local storage of the asset owner. The minting contract cannot immediately transfer the ownership tokens because both the asset owner and asset smart signature must opt in to the ownership asset and the asset ID is not known until the proof is verified and the ownership token pair is created. The asset owner can then claim ownership of the asset by opting in to the ownership token and requesting the minting contract to transfer the tokens. The minting contract will extract the ownership token ID and asset address from the local storage of the asset owner, transfer the ownership tokens to the owner and asset smart signature, and then delete the local storage of the asset owner.
+
+The ownership tokens allow the minted asset to function like a non-fungible token. It is effectively unique as its twin is frozen in the asset smart signature address and can never leave. The original asset owner can transfer the on-chain ownership of the asset to another user or DeFi protocol and could burn the asset by burning the ownership token. The asset smart signature allows the verified asset properties to be stored on-chain and easily accessed by other smart contracts by comparing ownership tokens.
+
+![SILENTDATA whitepaper(1)](https://user-images.githubusercontent.com/12896404/197568667-7f0a5448-7a7b-469a-ba9d-949e23a0cee3.png)
 
 ## Setup
 
