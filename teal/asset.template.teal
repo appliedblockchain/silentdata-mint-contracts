@@ -1,0 +1,208 @@
+#pragma version 5
+
+// Ensure uniqueness
+byte 0x<SILENTDATA_ASSET_ID>
+byte "0"
+!=
+assert
+
+// ----- COMMON VALIDATION -----
+
+txn CloseRemainderTo
+global ZeroAddress
+==
+assert
+
+txn AssetCloseTo
+global ZeroAddress
+==
+assert
+
+txn RekeyTo
+global ZeroAddress
+==
+assert
+
+// Asset sender only used for clawback transactions
+txn AssetSender
+global ZeroAddress
+==
+assert
+
+// Should never be able to transfer algos
+txn Amount
+int 0
+==
+assert
+
+// Should never be able to transfer an asset (only opt-in)
+txn AssetAmount
+int 0
+==
+assert
+
+// Fee should always be paid by another transaction in the group
+txn Fee
+int 0
+==
+assert
+
+// Allow opt in to minting application
+txn ApplicationID
+callsub get_minting_app_id
+==
+bnz handle_minting_app_opt_in
+
+// Must be grouped:
+// 0 -> 'permission' call to minting application
+// 1 -> transaction providing minimum balance to the asset LogicSig
+// 2 -> the opt-in transaction
+global GroupSize
+int 3
+==
+assert
+
+// First transaction in group should be 'permission' call to minting application
+gtxn 0 TypeEnum
+int appl
+==
+assert
+
+gtxn 0 ApplicationID
+callsub get_minting_app_id
+==
+assert
+
+gtxn 0 OnCompletion
+int NoOp
+==
+assert
+
+gtxna 0 ApplicationArgs 0
+byte "permission"
+==
+assert
+
+// Second transaction in group should be payment to this account
+gtxn 1 TypeEnum
+int pay
+==
+assert
+
+// Permission no-op will verify the transfer is between the correct parties
+
+// Third transaction should be this
+txn GroupIndex
+int 2
+==
+assert
+
+// ----- ROUTING -----
+
+// Handle opt-in to asset
+txn TypeEnum
+int axfer
+==
+bnz handle_asset_opt_in
+
+// Handle opt-in to application
+txn TypeEnum
+int appl
+==
+bnz handle_app_opt_in
+
+err
+
+// ----- BRANCHES -----
+
+// BRANCH handle_minting_app_opt_in START
+handle_minting_app_opt_in:
+  txn TypeEnum
+  int appl
+  ==
+  assert
+
+  txn OnCompletion
+  int OptIn
+  ==
+  assert
+
+  // Allow for any number of fund transactions
+  global GroupSize
+  int 4
+  >=
+  assert
+
+  // Fourth transaction in group should be 'mint' call to minting application
+  gtxn 3 TypeEnum
+  int appl
+  ==
+  assert
+
+  gtxn 3 ApplicationID
+  callsub get_minting_app_id
+  ==
+  assert
+
+  gtxn 3 OnCompletion
+  int NoOp
+  ==
+  assert
+
+  gtxna 3 ApplicationArgs 0
+  byte "mint"
+  ==
+  assert
+
+  b approve
+// BRANCH handle_minting_app_opt_in START
+
+// BRANCH handle_asset_opt_in START
+handle_asset_opt_in:
+
+  // Opt-in transaction is an asset transfer of zero value, to and from the LogicSig
+  txn AssetReceiver
+  txn Sender
+  ==
+  assert
+
+  // Minting application checks that the ID of the asset being opted into is as expected
+
+  b approve
+
+// BRANCH handle_asset_opt_in END
+
+// BRANCH handle_app_opt_in START
+handle_app_opt_in:
+
+  txn OnCompletion
+  int OptIn
+  ==
+  assert
+
+  // Minting application checks that the requester is the current owner of the asset
+
+  b approve
+
+// BRANCH handle_app_opt_in END
+
+// BRANCH approve START
+approve:
+  int 1
+  return
+// BRANCH approve END
+
+// BRANCH reject START
+reject:
+  int 0
+  return
+// BRANCH reject END
+
+// ----- SUBROUTINES -----
+
+// SUBROUTINE get_minting_app_id START
+get_minting_app_id:
+  byte 0x<MINTING_APP_ID_BYTES>
+  btoi
+  retsub
+// SUBROUTINE get_minting_app_id END

@@ -1,0 +1,1229 @@
+#pragma version 5
+
+// ----- ROUTING -----
+
+// Block DeleteApplication
+txn OnCompletion
+int DeleteApplication
+==
+bnz reject
+
+// Block UpdateApplication
+txn OnCompletion
+int UpdateApplication
+==
+bnz reject
+
+// Block CloseOut
+txn OnCompletion
+int CloseOut
+==
+bnz reject
+
+
+// Handle creation
+txn ApplicationID
+int 0
+==
+bnz handle_create
+
+// Handle NoOp
+txn OnCompletion
+int NoOp
+==
+bnz handle_no_op
+
+// Allow OptIn
+txn OnCompletion
+int OptIn
+==
+bnz approve
+
+err
+
+// ----- BRANCHES -----
+
+// BRANCH handle_create START
+handle_create:
+  // arguments
+  //   0:    signing key (bytes)
+  //   1:    expected check_hash (bytes)
+  //   2:    expected number of parameters in proof certificate
+  //   3-15: parameter names in proof certificate
+
+  txn NumAppArgs
+  int 3
+  >
+  assert
+
+  // Store the enclave signing key & check hash
+  byte "enclave_signing_key"
+  txna ApplicationArgs 0
+  app_global_put
+
+  byte "expected_check_hash"
+  txna ApplicationArgs 1
+  app_global_put
+
+  byte "n_params"
+  txna ApplicationArgs 2
+  btoi
+  app_global_put
+
+  // Ensure the number of arguments matches the number of parameters
+  txn NumAppArgs
+  int 3 // signing key, expected check_hash, number of params
+  -
+  txna ApplicationArgs 2
+  btoi
+  ==
+  assert
+
+  // Put any other arguments in global storage
+  // Starting with argument with index 3
+  int 3
+  b store_schema_params
+
+// BRANCH handle_create END
+
+// BRANCH handle_no_op START
+handle_no_op:
+  // arguments
+  //   0: "fund", "mint", "claim", or "permission"
+
+  // Dummy NoOp for pooling app call cost limits
+  txna ApplicationArgs 0
+  byte "fund"
+  ==
+  bnz approve
+
+  txna ApplicationArgs 0
+  byte "set_key"
+  ==
+  bnz set_key
+
+  txna ApplicationArgs 0
+  byte "mint"
+  ==
+  bnz handle_mint
+
+  txna ApplicationArgs 0
+  byte "claim"
+  ==
+  bnz handle_claim
+
+  txna ApplicationArgs 0
+  byte "permission"
+  ==
+  bnz handle_permission
+
+  err
+// BRANCH handle_no_op START
+
+// BRANCH set_key START
+set_key:
+  // arguments
+  //   0: "set_key", used to route to this branch
+  //   1: signing key (bytes)
+
+  callsub check_admin
+
+  global GroupSize
+  int 1
+  ==
+  assert
+
+  txn NumAppArgs
+  int 2
+  ==
+  assert
+
+  byte "enclave_signing_key"
+  txna ApplicationArgs 1
+  app_global_put
+
+  b approve
+// BRANCH set_key END
+
+// BRANCH handle_mint START
+handle_mint:
+  // arguments
+  //   0: "mint", used to route to this branch
+  //   1: signature : (bytes)
+  //   2: certificate data : (bytes), encoded in CBOR
+  // accounts
+  //   0: sender (default)
+  //   1: asset logicsig account
+
+  txn NumAppArgs
+  int 3
+  ==
+  assert
+
+  // Doesn't count the sender default
+  txn NumAccounts
+  int 1
+  ==
+  assert
+
+  // Ensure that the local storage of the the logicsig account hasn't already been written to
+  // In this way, once a certificate is verified for a given silentdata asset ID, we forbid
+  // verification of a new (possibly different) certificate for the same silentdata asset ID
+  callsub get_asset_logicsig
+  global CurrentApplicationID
+  byte "check_hash"
+  app_local_get_ex
+  !
+  assert
+  pop
+
+  // Verify the data was signed by the enclave
+  txna ApplicationArgs 2 // signed certificate data
+  txna ApplicationArgs 1 // signature
+  byte "enclave_signing_key"
+  app_global_get
+  ed25519verify
+  assert
+
+  // Parse the proof certificate data & store in local storage of LogicSig account
+  // ATTN only permanantely stored if this application call is approved
+  callsub parse_proof
+
+  // Verify check_hash matches expectation
+  byte "check_hash"
+  callsub get_certificate_property
+  byte "expected_check_hash"
+  app_global_get
+  ==
+  assert
+
+  // Verify the logicsig address in the proof data matches the input
+  byte "lsig_pkey"
+  callsub get_certificate_property
+  callsub get_asset_logicsig
+  ==
+  assert
+
+  // Verify the sender of this transaction is the asset initiator
+  byte "initiator_pkey"
+  callsub get_certificate_property
+  txn Sender
+  ==
+  assert
+
+  // Ensure that the number of parsed parameters meets the expectation
+  callsub get_num_params
+  byte "n_params"
+  app_global_get
+  ==
+  assert
+
+  // Mint the ownership tokens!
+  b mint_ownership_tokens
+// BRANCH handle_mint END
+
+// BRANCH handle_claim START
+handle_claim:
+  // arguments
+  //   0: "claim", used to route to this branch
+  // accounts
+  //   0: sender (default)
+  //   1: asset logicsig account
+  // assets
+  //   0: the asset corresponding to the supplied asset logicsig account
+
+  txn NumAppArgs
+  int 1
+  ==
+  assert
+
+  // Doesn't count the sender default
+  txn NumAccounts
+  int 1
+  ==
+  assert
+
+  txn NumAssets
+  int 1
+  ==
+  assert
+
+  // Ensure the supplied asset ID corresponds to the logicsig account
+  byte "asa_id"
+  callsub get_certificate_property
+  txna Assets 0
+  ==
+  assert
+
+  // Ensure that the sender is the asset initiator
+  byte "initiator_pkey"
+  callsub get_certificate_property
+  txn Sender
+  ==
+  assert
+
+  // Check the application still owns both the minted tokens
+  global CurrentApplicationAddress
+  txna Assets 0
+  asset_holding_get AssetBalance
+  assert
+  int 2
+  ==
+  assert
+
+  // Send the asset to the logicsig
+  // ATTN this will fail if receiver hasn't already opted in so no need to check explicitly
+  itxn_begin
+    int axfer
+    itxn_field TypeEnum
+
+    callsub get_asset_logicsig
+    itxn_field AssetReceiver
+
+    txna Assets 0
+    itxn_field XferAsset
+
+    int 1
+    itxn_field AssetAmount
+
+    int 0
+    itxn_field Fee
+  itxn_submit
+
+  // Send the asset to the asset initiator
+  // ATTN this will fail if receiver hasn't already opted in so no need to check explicitly
+  itxn_begin
+    int axfer
+    itxn_field TypeEnum
+
+    txn Sender
+    itxn_field AssetReceiver
+
+    txna Assets 0
+    itxn_field XferAsset
+
+    int 1
+    itxn_field AssetAmount
+
+    int 0
+    itxn_field Fee
+  itxn_submit
+
+  b approve
+// BRANCH handle_claim START
+
+// BRANCH handle_permission START
+handle_permission:
+
+  // arguments
+  //   0: "permission", used to route to this branch
+  // accounts
+  //   0: sender (default)
+  //   1: asset logicsig account
+  // assets
+  //   0: the asset corresponding to the supplied asset logicsig account
+  //      (optional - required for opt-in to foreign application)
+
+  // Must be grouped:
+  // 0 -> 'permission' call to minting application (this)
+  // 1 -> transaction providing minimum balance to the asset LogicSig
+  // 2 -> the opt-in transaction
+  global GroupSize
+  int 3
+  ==
+  assert
+
+  // First transaction should be this
+  txn GroupIndex
+  int 0
+  ==
+  assert
+
+  // Second transaction should be a payment to the asset logicsig account
+  gtxn 1 TypeEnum
+  int pay
+  ==
+  assert
+
+  gtxn 1 Receiver
+  callsub get_asset_logicsig
+  ==
+  assert
+
+  // Route based on the type of the third transaction
+  gtxn 2 TypeEnum
+  int axfer
+  ==
+  bnz handle_asset_permission
+
+  gtxn 2 TypeEnum
+  int appl
+  ==
+  bnz handle_application_permission
+
+  b reject
+
+// BRANCH handle_permission END
+
+// BRANCH handle_asset_permission START
+handle_asset_permission:
+  // arguments
+  //   0: "permission", used to route to this branch
+  // accounts
+  //   0: sender (default)
+  //   1: asset logicsig account
+
+  // Asset opt in is transfer of zero assets to and from the asset logicsig
+  gtxn 2 AssetAmount
+  int 0
+  ==
+  assert
+
+  gtxn 2 Sender
+  callsub get_asset_logicsig
+  ==
+  assert
+
+  gtxn 2 AssetReceiver
+  callsub get_asset_logicsig
+  ==
+  assert
+
+  // Only give permission for the opt-in if the asset that the LogicSig is opting in to
+  // is the one that is written into its local storage as 'asa_id' by this minting app
+  byte "asa_id"
+  callsub get_certificate_property
+  gtxn 2 XferAsset
+  ==
+  assert
+
+  // Sender of this transaction must be the asset initiator
+  byte "initiator_pkey"
+  callsub get_certificate_property
+  txn Sender
+  ==
+  assert
+
+  b approve
+
+// BRANCH handle_asset_permission END
+
+// BRANCH handle_application_permission START
+handle_application_permission:
+
+  // arguments
+  //   0: "permission", used to route to this branch
+  // accounts
+  //   0: sender (default)
+  //   1: asset logicsig account
+  // assets
+  //   0: the asset corresponding to the supplied asset logicsig account
+
+  // Must be an opt in
+  gtxn 2 OnCompletion
+  int OptIn
+  ==
+  assert
+
+  // Ensure the asset in the input matches the asset logicsig
+  txn NumAssets
+  int 1
+  ==
+  assert
+
+  byte "asa_id"
+  callsub get_certificate_property
+  txna Assets 0
+  ==
+  assert
+
+  // Only grant permission to opt in to another application
+  // if requested by the owner of the asset (holds the ownership token)
+  txn Sender
+  txna Assets 0
+  asset_holding_get AssetBalance
+  assert
+  int 1
+  >=
+  assert
+
+  b approve
+
+// BRANCH handle_application_permission END
+
+// BRANCH store_schema_params START
+store_schema_params:
+
+  // Expect top of stack to be the index of the argument
+
+  // If this is the last argument, then move to the validation step
+  dup
+  txn NumAppArgs
+  >=
+  bnz validate_schema_params
+
+  // Get the application argument
+  dup
+  txnas ApplicationArgs
+  dup
+
+  // Extract the type (first byte)
+  int 0
+  getbyte
+
+  // Verify that it's either "i" for integers or "b" for byte slices
+  dup
+  dup
+  byte "i"
+  btoi
+  ==
+  swap
+  byte "b"
+  btoi
+  ==
+  ||
+  assert
+
+  // Extract the name (remaining bytes)
+  swap
+  dup
+  len
+  int 1
+  -
+  int 1
+  swap
+  extract3
+  swap
+
+  // Top two elements of stack should be the name & type
+  // Verify the name isn't reserved for another purpose
+  dig 1
+  byte "enclave_signing_key"
+  ==
+  bnz reject
+
+  dig 1
+  byte "expected_check_hash"
+  ==
+  bnz reject
+
+  dig 1
+  byte "n_params"
+  ==
+  bnz reject
+
+  dig 1
+  byte "asa_id"
+  ==
+  bnz reject
+
+  // Put this schema param into global storage
+  app_global_put
+
+  // Increment the argument index counter by one
+  int 1
+  +
+
+  b store_schema_params
+
+// BRANCH store_schema_params END
+
+// BRANCH validate_schema_params START
+validate_schema_params:
+
+  // Every schema must have a check_hash
+  global CurrentApplicationID
+  byte "check_hash"
+  app_global_get_ex
+  assert
+
+  // The check hash must be a byte-slice
+  byte "b"
+  btoi
+  ==
+  assert
+
+  // Every schema must have an lsig_pkey to store the certificate data
+  global CurrentApplicationID
+  byte "lsig_pkey"
+  app_global_get_ex
+  assert
+
+  // The lsig_pkey must be a byte-slice
+  byte "b"
+  btoi
+  ==
+  assert
+
+  // Every schema must have an initiator_pkey that can claim the minted asset
+  global CurrentApplicationID
+  byte "initiator_pkey"
+  app_global_get_ex
+  assert
+
+  // The initiator_pkey must be a byte-slice
+  byte "b"
+  btoi
+  ==
+  assert
+
+  // Every schema must have a unique asset identifier from which the lsig_pkey is derived
+  global CurrentApplicationID
+  byte "asset_id"
+  app_global_get_ex
+  assert
+
+  // The asset_id must be a byte-slice
+  byte "b"
+  btoi
+  ==
+  assert
+
+  b approve
+// BRANCH validate_schema_params END
+
+// BRANCH mint_ownership_tokens START
+mint_ownership_tokens:
+
+  itxn_begin
+    int acfg
+    itxn_field TypeEnum
+
+    // Mint two instances of the token, one for asset LogicSig & the other for the asset owner
+    int 2
+    itxn_field ConfigAssetTotal
+    int 0
+    itxn_field ConfigAssetDecimals
+
+    byte "SD-OWN"
+    itxn_field ConfigAssetUnitName
+
+    byte "SILENTDATA asset ownership token"
+    itxn_field ConfigAssetName
+
+    // Concatenate a base URL with the public key of the logicsig
+    byte "https://defi.silentdata.com/a/"
+    byte "id"
+    callsub get_certificate_property
+    concat
+    itxn_field ConfigAssetURL
+
+    // Store the logicsig public key in the metadata
+    byte "lsig_pkey"
+    callsub get_certificate_property
+    itxn_field ConfigAssetMetadataHash
+
+    // This application handles management, reserve, freeze & callback
+    global CurrentApplicationAddress
+    dup
+    dup2
+    itxn_field ConfigAssetManager
+    itxn_field ConfigAssetReserve
+    itxn_field ConfigAssetFreeze
+    itxn_field ConfigAssetClawback
+
+    int 0
+    itxn_field Fee
+  itxn_submit
+  itxn CreatedAssetID
+
+  // Put the newly minted asset ID in the local storage of the asset logicsig
+  int 1
+  byte "asa_id"
+  uncover 2
+  app_local_put
+
+  b approve
+
+// BRANCH mint_ownership_tokens END
+
+// BRANCH approve START
+approve:
+  int 1
+  return
+// BRANCH approve END
+
+// BRANCH reject START
+reject:
+  int 0
+  return
+// BRANCH reject END
+
+// ----- SUBROUTINES -----
+
+// SUBROUTINE check_admin START
+check_admin:
+  txn Sender
+  global CreatorAddress
+  ==
+  assert
+
+  retsub
+// SUBROUTINE check_admin END
+
+// ----- CBOR PARSING -----
+
+// SUBROUTINE parse_proof START
+parse_proof:
+  callsub parse_current_byte
+  callsub get_cbor_type
+  callsub check_map_type
+  assert                 // assert (type == map)
+
+  callsub get_cbor_info  // Number of key-value pairs in map
+  dup
+  btoi
+  dup
+  callsub set_num_keys   // num_keys = uint(current_byte & 00011111)
+  callsub set_num_params
+  callsub check_cbor_max_size
+  assert                 // assert (num_keys <= 23)
+
+  int 1
+  callsub set_byte_i     // byte_i = 1
+
+  callsub parse_cbor_map
+  retsub
+// SUBROUTINE parse_proof END
+
+// SUBROUTINE parse_cbor_map START
+parse_cbor_map:
+  // Check if all key-value pairs have been read
+  callsub get_num_keys
+  bz finish_parse // If no keys left to parse, finish
+
+  callsub parse_cbor_key
+  callsub parse_cbor_value
+  callsub save_values
+
+  // Decrement number of key-value pairs remaining
+  callsub get_num_keys
+  int 1
+  -
+  callsub set_num_keys
+
+  b parse_cbor_map // Loop
+// SUBROUTINE parse_cbor_map END
+
+// SUBROUTINE finish_parse START
+finish_parse:
+  retsub
+// SUBROUTINE finish_parse END
+
+// SUBROUTINE parse_cbor_key START
+parse_cbor_key:
+  // First 3 bits of next byte should be 011 = 3 (text string), next 5 bits = number of characters in string = X
+  // Check type of key is a text string with length <= 23
+  callsub parse_current_byte
+  callsub get_cbor_type
+  callsub check_text_string_type
+  assert                 // assert (type_key == text_string)
+
+  callsub get_cbor_info  // Length of key string
+  dup
+  btoi
+  callsub set_key_length
+  callsub check_cbor_max_size
+  assert                 // assert (key_length <= 23)
+
+  // Increment current byte index
+  int 1
+  callsub increment_byte // byte_i ++
+
+  // Get the key string bytes
+  callsub get_key_length
+  callsub parse_n_bytes    // data[byte_i:byte_i+key_length]
+  callsub set_current_key
+
+  callsub get_key_length
+  callsub increment_byte // byte_i += key_length
+
+  retsub
+// SUBROUTINE parse_cbor_key END
+
+// SUBROUTINE parse_cbor_value START
+parse_cbor_value:
+  // Get first 3 bits of next byte for type (000 = unsigned int, 010 = byte string, 011 = text string)
+  // Get the value type and further information
+  callsub parse_current_byte
+  int 1
+  callsub increment_byte // byte_i ++
+
+  callsub get_cbor_type
+  callsub set_value_type
+  callsub get_cbor_info  // Length or further type
+  callsub set_value_info
+
+  // Check value type (byte and text strings are the same to TEAL)
+  callsub get_value_type
+  callsub check_int_type
+  bnz parse_cbor_int
+
+  callsub get_value_type
+  callsub check_byte_string_type
+  bnz parse_cbor_string
+
+  callsub get_value_type
+  callsub check_text_string_type
+  bnz parse_cbor_string
+
+  // Some encoders optionally add an integer tag before some values
+  callsub get_value_type
+  callsub check_tag_type
+  assert
+
+  // Move past the integer tag & then parse the value
+  callsub parse_cbor_int
+  b parse_cbor_value
+// SUBROUTINE parse_cbor_value END
+
+// SUBROUTINE parse_cbor_int START
+parse_cbor_int:
+  // If unsigned int and byte <= 0x17, last 5 bits of current byte are the number
+  callsub get_value_info
+  callsub check_cbor_max_size // if (value_info <= 23) parse_cbor_small_uint
+  bnz parse_cbor_small_uint
+
+  // If unsigned int and byte == 0x18, next byte is the number
+  callsub get_value_info
+  callsub check_uint8_type
+  bnz parse_cbor_uint8
+
+  // If unsigned int and byte == 0x19, next 2 bytes are the number
+  callsub get_value_info
+  callsub check_uint16_type
+  bnz parse_cbor_uint16
+
+  // If unsigned int and byte == 0x1A, next 4 bytes are the number
+  callsub get_value_info
+  callsub check_uint32_type
+  bnz parse_cbor_uint32
+
+  // If unsigned int and byte == 0x1B, next 8 bytes are the number
+  callsub get_value_info
+  callsub check_uint64_type
+  bnz parse_cbor_uint64
+
+  // Fail if value info is anything else
+  err
+// SUBROUTINE parse_cbor_int END
+
+// SUBROUTINE parse_cbor_small_uint START
+parse_cbor_small_uint:
+  callsub get_value_info
+  btoi
+  callsub set_current_value
+
+  retsub
+// SUBROUTINE parse_cbor_small_uint END
+
+// SUBROUTINE parse_cbor_uint8 START
+parse_cbor_uint8:
+  int 1
+  callsub parse_n_bytes    // data[byte_i]
+  btoi
+  callsub set_current_value
+
+  int 1
+  callsub increment_byte // byte_i ++
+
+  retsub
+// SUBROUTINE parse_cbor_uint8 END
+
+// SUBROUTINE parse_cbor_uint16 START
+parse_cbor_uint16:
+  txna ApplicationArgs 2 // data
+  callsub get_byte_i
+  extract_uint16         // data[byte_i:byte_i+2]
+  callsub set_current_value
+
+  int 2
+  callsub increment_byte // byte_i += 2
+
+  retsub
+// SUBROUTINE parse_cbor_uint16 END
+
+// SUBROUTINE parse_cbor_uint32 START
+parse_cbor_uint32:
+  txna ApplicationArgs 2 // data
+  callsub get_byte_i
+  extract_uint32         // data[byte_i:byte_i+4]
+  callsub set_current_value
+
+  int 4
+  callsub increment_byte // byte_i += 4
+
+  retsub
+// SUBROUTINE parse_cbor_uint32 END
+
+// SUBROUTINE parse_cbor_uint64 START
+parse_cbor_uint64:
+  txna ApplicationArgs 2 // data
+  callsub get_byte_i
+  extract_uint64         // data[byte_i:byte_i+8]
+  callsub set_current_value
+
+  int 8
+  callsub increment_byte // byte_i += 8
+
+  retsub
+// SUBROUTINE parse_cbor_uint64 END
+
+// SUBROUTINE parse_cbor_string START
+parse_cbor_string:
+  callsub get_value_info
+  callsub check_cbor_max_size // if (value_info <= 23) parse_cbor_short_string
+  bnz parse_cbor_short_string
+
+  callsub get_value_info
+  callsub check_long_string_type
+  bnz parse_cbor_long_string
+
+  // Fail if string length longer than 1 byte
+  err
+// SUBROUTINE parse_cbor_string END
+
+// SUBROUTINE parse_cbor_short_string START
+parse_cbor_short_string:
+  callsub get_value_info
+  btoi
+  callsub parse_n_bytes    // data[byte_i:byte_i+int(value_info)]
+  callsub set_current_value
+
+  callsub get_value_info
+  btoi
+  callsub increment_byte // byte_i += int(value_info)
+
+  retsub
+// SUBROUTINE parse_cbor_short_string END
+
+// SUBROUTINE parse_cbor_long_string START
+parse_cbor_long_string:
+  int 1
+  callsub parse_n_bytes    // data[byte_i]
+  btoi
+  callsub set_value_length
+
+  int 1
+  callsub increment_byte // byte_i ++
+
+  callsub get_value_length
+  callsub parse_n_bytes    // data[byte_i:byte_i+value_length]
+  callsub set_current_value
+
+  callsub get_value_length
+  callsub increment_byte // byte_i += value_length
+
+  retsub
+// SUBROUTINE parse_cbor_long_string END
+
+// SUBROUTINE save_values START
+save_values:
+
+  // This key must have been supplied as part of the schema upon creation of the contract
+  global CurrentApplicationID
+  callsub get_current_key
+  app_global_get_ex
+  assert
+
+  // Verify the type matches the schema
+  byte "b"
+  btoi
+  byte "i"
+  btoi
+  callsub get_value_type
+  callsub check_int_type
+  select
+  ==
+  assert
+
+  // Store the value into the LogicSig's local state
+  callsub get_asset_logicsig
+  callsub get_current_key
+  callsub get_current_value
+  app_local_put
+
+  retsub
+// SUBROUTINE save_values END
+
+// SUBROUTINE parse_current_byte START
+parse_current_byte:
+  txna ApplicationArgs 2 // data
+  callsub get_byte_i
+  int 1
+  extract3               // data[byte_i]
+  callsub set_current_byte
+
+  retsub
+// SUBROUTINE parse_current_byte END
+
+// SUBROUTINE parse_n_bytes START
+parse_n_bytes:
+  // n_bytes = number of bytes to get on top of stack
+  txna ApplicationArgs 2 // data
+  swap // data -> n_bytes
+  callsub get_byte_i
+  swap // data -> byte_i -> n_bytes
+  extract3               // data[byte_i:byte_i + n_bytes]
+
+  retsub
+// SUBROUTINE parse_n_bytes END
+
+// SUBROUTINE increment_byte START
+increment_byte:
+  // i = int on top of stack
+  callsub get_byte_i
+  +
+  callsub set_byte_i // byte_i += i
+
+  retsub
+// SUBROUTINE increment_byte END
+
+// SUBROUTINE get_cbor_type START
+get_cbor_type:
+  callsub get_current_byte
+  byte 0xe0              // 11100000
+  b&                     // Get first 3 bits (type key)
+
+  retsub
+// SUBROUTINE get_cbor_type_END
+
+// SUBROUTINE get_cbor_info START
+get_cbor_info:
+  callsub get_current_byte
+  byte 0x1f              // 00011111
+  b&                     // Get last 5 bits (length or further type)
+
+  retsub
+// SUBROUTINE get_cbor_info_END
+
+// SUBROUTINE check_map_type START
+check_map_type:
+  byte 0xa0              // 10100000 (101 = map)
+  ==
+
+  retsub
+// SUBROUTINE check_map_type END
+
+// SUBROUTINE check_tag_type START
+check_tag_type:
+  byte 0xC0              // 11000000 (110 = optional tag)
+  ==
+
+  retsub
+// SUBROUTINE check_tag_type END
+
+// SUBROUTINE check_text_string_type START
+check_text_string_type:
+  byte 0x60              // 01100000 (011 = text string)
+  ==
+
+  retsub
+// SUBROUTINE check_text_string_type END
+
+// SUBROUTINE check_int_type START
+check_int_type:
+  byte 0x00              // Integer
+  ==
+
+  retsub
+// SUBROUTINE check_int_type END
+
+// SUBROUTINE check_uint8_type START
+check_uint8_type:
+  byte 0x18              // uint8
+  ==
+
+  retsub
+// SUBROUTINE check_uint8_type END
+
+// SUBROUTINE check_uint16_type START
+check_uint16_type:
+  byte 0x19              // uint16
+  ==
+
+  retsub
+// SUBROUTINE check_uint16_type END
+
+// SUBROUTINE check_uint32_type START
+check_uint32_type:
+  byte 0x1a              // uint32
+  ==
+
+  retsub
+// SUBROUTINE check_uint32_type END
+
+// SUBROUTINE check_uint64_type START
+check_uint64_type:
+  byte 0x1b              // uint64
+  ==
+
+  retsub
+// SUBROUTINE check_uint64_type END
+
+// SUBROUTINE check_byte_string_type START
+check_byte_string_type:
+  byte 0x40              // Byte string
+  ==
+
+  retsub
+// SUBROUTINE check_byte_string_type END
+
+// SUBROUTINE check_long_string_type START
+check_long_string_type:
+  byte 0x18              // Long string
+  ==
+
+  retsub
+// SUBROUTINE check_long_string_type END
+
+// SUBROUTINE check_cbor_max_size END
+check_cbor_max_size:
+  byte 0x17 // 00010111 = 23 (maximum length that fits into last 5 bits)
+  b<=
+
+  retsub
+// SUBROUTINE check_cbor_max_size END
+
+// SUBROUTINE get_certificate_property START
+get_certificate_property:
+  // Expect key name at top of stack
+  // Expect LogicSig address to be at index 1 in input accounts array
+
+  callsub get_asset_logicsig
+  global CurrentApplicationID
+  uncover 2
+  app_local_get_ex
+  assert // Key must exist
+
+  retsub
+// SUBROUTINE get_certificate_property END
+
+// SUBROUTINE get_asset_logicsig START
+get_asset_logicsig:
+  txna Accounts 1
+
+  retsub
+// SUBROUTINE get_asset_logicsig END
+
+// ----- SCRATCH SPACE SETTERS AND GETTERS -----
+
+// SUBROUTINE set_current_byte START
+set_current_byte:
+  store 0
+  retsub
+// SUBROUTINE set_current_byte END
+
+// SUBROUTINE get_current_byte START
+get_current_byte:
+  load 0
+  retsub
+// SUBROUTINE get_current_byte END
+
+// SUBROUTINE set_byte_i START
+set_byte_i:
+  store 1
+  retsub
+// SUBROUTINE set_byte_i END
+
+// SUBROUTINE get_byte_i START
+get_byte_i:
+  load 1
+  retsub
+// SUBROUTINE get_byte_i END
+
+// SUBROUTINE set_num_keys START
+set_num_keys:
+  store 2
+  retsub
+// SUBROUTINE set_num_keys END
+
+// SUBROUTINE get_num_keys START
+get_num_keys:
+  load 2
+  retsub
+// SUBROUTINE get_num_keys END
+
+// SUBROUTINE set_key_length START
+set_key_length:
+  store 3
+  retsub
+// SUBROUTINE set_key_length END
+
+// SUBROUTINE get_key_length START
+get_key_length:
+  load 3
+  retsub
+// SUBROUTINE get_key_length END
+
+// SUBROUTINE set_current_key START
+set_current_key:
+  store 4
+  retsub
+// SUBROUTINE set_current_key END
+
+// SUBROUTINE get_current_key START
+get_current_key:
+  load 4
+  retsub
+// SUBROUTINE get_current_key END
+
+// SUBROUTINE set_value_type START
+set_value_type:
+  store 5
+  retsub
+// SUBROUTINE set_value_type END
+
+// SUBROUTINE get_value_type START
+get_value_type:
+  load 5
+  retsub
+// SUBROUTINE get_value_type END
+
+// SUBROUTINE set_current_value START
+set_current_value:
+  store 6
+  retsub
+// SUBROUTINE set_current_value END
+
+// SUBROUTINE get_current_value START
+get_current_value:
+  load 6
+  retsub
+// SUBROUTINE get_current_value END
+
+// SUBROUTINE set_value_info START
+set_value_info:
+  store 7
+  retsub
+// SUBROUTINE set_value_info END
+
+// SUBROUTINE get_value_info START
+get_value_info:
+  load 7
+  retsub
+// SUBROUTINE get_value_info END
+
+// SUBROUTINE set_value_length START
+set_value_length:
+  store 8
+  retsub
+// SUBROUTINE set_value_length END
+
+// SUBROUTINE get_value_length START
+get_value_length:
+  load 8
+  retsub
+// SUBROUTINE get_value_length END
+
+// SUBROUTINE set_num_params START
+set_num_params:
+  store 9
+  retsub
+// SUBROUTINE set_num_params END
+
+// SUBROUTINE get_num_params START
+get_num_params:
+  load 9
+  retsub
+// SUBROUTINE get_num_params END
