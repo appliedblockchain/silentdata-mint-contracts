@@ -1,5 +1,7 @@
 # silentdata-mint/contracts: Algorand smart contracts and supporting components
 
+This code has not been security audited and should only be used as an example.
+
 ## Setup
 
 ``` bash
